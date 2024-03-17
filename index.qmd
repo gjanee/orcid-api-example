@@ -79,7 +79,7 @@ attr(result, "found")
 
 # Formulating the query
 
-ORCID internally maintains structured records, and in principle its database could be queried for people whose current employment is UCSB.  But that level of granularity is not exposed through the API.  The only queries supported are freetext search and search over a handful of [named fields](https://info.orcid.org/ufaqs/which-fields-does-the-orcid-search-api-support/) such as `email` as shown previously.  For our purposes, `affiliation-org-name` is the relevant field.  Note that this field aggregates all affiliations, including employment, education, and perhaps other types.  It is also possible to search by various types of organization identifiers (GRID, ROR, RINGGOLD), but these are unlikely to be entered by laypeople.  If they appear, they will have been auto-populated by publishers or institutional integrations (not applicable to UCSB), or by ORCID itself when an organization is selected from the pulldown menu that pops up when somebody starts typing some text.  So, we stick with searching over the `affiliation-org-name` text field.
+ORCID internally maintains structured records, and in principle its database could be queried for people whose current employment is UCSB.  But that level of granularity is not exposed through the API.  The only queries supported are freetext search over entire profiles and search over a handful of [named fields](https://info.orcid.org/ufaqs/which-fields-does-the-orcid-search-api-support/) such as `email` as shown previously.  For our purpose, `affiliation-org-name` is the relevant field.  Note that this field aggregates all affiliations, including employment, education, and perhaps other types.  It is also possible to search by various types of organization identifiers (GRID, ROR, RINGGOLD), but these are unlikely to be entered by laypeople.  If they appear, they will have been auto-populated by publishers or institutional integrations (the latter not applicable to UCSB), or by ORCID itself when an organization is selected from the menu that pops up when somebody starts typing some text.  So, we stick with searching over the `affiliation-org-name` text field.
 
 Here are the names for UCSB we'll look for:
 
@@ -110,7 +110,7 @@ tibble(
 
 # Results pagination
 
-Query results are paginated.  To retrieve all rows we write a function that requests 200 rows at a time, and concatenates them into a single dataframe.
+Query results are paginated.  To retrieve all rows we write a function that requests 200 rows at a time and concatenates them into a single dataframe.
 
 ```{r}
 orcid_query_all_results <- function(query) {
