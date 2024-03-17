@@ -1,0 +1,360 @@
+---
+title: "ORCID API Example"
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-block-background: true
+    df-print: kable
+    css: styles.css
+
+editor: source
+---
+
+Greg Janée, March 2024
+
+Example of querying the [ORCID Public API](https://info.orcid.org/documentation/features/public-api/) from R using the [rorcid](https://cran.r-project.org/web/packages/rorcid/index.html) package.  In this example our goal is to find all ORCID IDs belonging to people who are currently employed at UCSB, and to do some rudimentary analysis.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(rorcid)
+library(stringdist)
+```
+
+## Getting access
+
+Log in to [ORCID](https://orcid.org) and, in the menu under your name, visit "Developer tools" to create a client ID.  The web form is intended for developers registering OAuth applications.  For the purpose of one-off API access it doesn't seem to matter what values you enter.
+
+There's no need to stash the returned client ID and client secret anywhere; they can always be viewed on that page.
+
+Next step is to obtain a token that will allow querying (and only querying) against the public API.  Presumably writing to ORCID profiles requires a different kind of token.  Run this curl command from the Bash command line:
+
+```{.bash exec=FALSE}
+curl -H 'Accept: application/json'    \
+     -d grant_type=client_credentials \
+     -d scope=/read-public            \
+     -d client_id=...                 \
+     -d client_secret=...             \
+     https://orcid.org/oauth/token
+```
+
+A JSON document is returned.  Copy the value of the `access_token` element and record it in a `.Renviron` file, located either in your home directory or in your R project's root directory, like so:
+
+```{.bash exec=FALSE}
+ORCID_TOKEN="..."
+```
+
+Restart R for it to take effect.  Neither the client ID nor the token mention an expiration date, so perhaps they last forever?
+
+# Query process overview
+
+The basic idea is to supply a query in the form of a string expression and get back a 3-column dataframe.  For example:
+
+```{r}
+result <- orcid("email:*@ucsb.edu")
+head(result)
+```
+
+Well as can be seen two of the columns are redundant.  Let's define a function to return a cleaner result.
+
+```{r}
+orcid_query <- function(query, start=NULL, rows=NULL) {
+    orcid(query, start, rows) %>%
+    as_tibble %>%
+    select(id=`orcid-identifier.path`)
+}
+
+result <- orcid_query("email:*@ucsb.edu")
+head(result)
+```
+
+The number of rows returned may be explicitly limited (that's the purpose of the `rows` argument above; more on pagination later), but even if not, ORCID limits the rows returned to 1,000 per call.  Furthermore, there's an overall limit of 10,000 rows maximum for any given query.  A nice feature is that, regardless of how many rows are returned, the total number is always returned as the `found` attribute:
+
+```{r}
+attr(result, "found")
+```
+
+(Only `r attr(result, "found")` ORCID IDs that have a `@ucsb.edu` email address?!  Remember we're using the public API, so only publicly available information is available to us.  Clearly most people are not making their email addresses public via ORCID.)
+
+# Formulating the query
+
+ORCID internally maintains structured records, and in principle its database could be queried for people whose current employment is UCSB.  But that level of granularity is not exposed through the API.  The only queries supported are freetext search and search over a handful of [named fields](https://info.orcid.org/ufaqs/which-fields-does-the-orcid-search-api-support/) such as `email` as shown previously.  For our purposes, `affiliation-org-name` is the relevant field.  Note that this field aggregates all affiliations, including employment, education, and perhaps other types.  It is also possible to search by various types of organization identifiers (GRID, ROR, RINGGOLD), but these are unlikely to be entered by laypeople.  If they appear, they will have been auto-populated by publishers or institutional integrations (not applicable to UCSB), or by ORCID itself when an organization is selected from the pulldown menu that pops up when somebody starts typing some text.  So, we stick with searching over the `affiliation-org-name` text field.
+
+Here are the names for UCSB we'll look for:
+
+```{r}
+ucsb_names <- c(
+    "University of California, Santa Barbara",  # official
+    "University of California at Santa Barbara",
+    "University of California Santa Barbara",
+    "UC Santa Barbara",
+    "UCSB"
+)
+```
+
+Just out of curiosity, how many IDs are returned for each name?
+
+```{r}
+tibble(
+    name=ucsb_names,
+    count=map_int(
+        ucsb_names,
+        function(name) {
+            query <- paste('affiliation-org-name:"', name, '"', sep="")
+            attr(orcid_query(query), "found")
+        }
+    )
+)
+```
+
+# Results pagination
+
+Query results are paginated.  To retrieve all rows we write a function that requests 200 rows at a time, and concatenates them into a single dataframe.
+
+```{r}
+orcid_query_all_results <- function(query) {
+    num_results <- attr(orcid_query(query, rows=1), "found")
+    reduce(
+        map(
+            seq(0, num_results, 200),
+            function(offset) {
+                orcid_query(query, offset, 200)
+            }
+        ),
+        bind_rows
+    )
+}
+```
+
+# Final query
+
+Here's our final query.  We look for IDs that have an affiliation that matches any of our UCSB names.  This query takes only a few seconds, but for good netiquette we cache the results.
+
+```{r}
+cache_file <- "ids.RData"
+
+if (file.exists(cache_file)) {
+    load(cache_file)
+} else {
+    ucsb_ids <- orcid_query_all_results(
+        paste(
+            paste('affiliation-org-name:"', ucsb_names, '"', sep=""),
+            collapse=" OR "
+        )
+    )
+    save(ucsb_ids, file=cache_file)
+}
+```
+
+How many IDs did we get?
+
+```{r}
+attr(ucsb_ids, "found")
+```
+
+Again, these are ORCID IDs that contain any kind of affiliation with UCSB, not necessarily employment, and not necessarily current employment.
+
+# Employment data
+
+Getting employment data is super easy: just pass the entire list of ORCID IDs in one batch.  This takes awhile, on the order of 10 minutes, so we cache the 80MB of data received.
+
+```{r}
+cache_file <- "employment.RData"
+
+if (file.exists(cache_file)) {
+    load(cache_file)
+} else {
+    employment_data <- orcid_employments(ucsb_ids$id)
+    save(employment_data, file=cache_file)
+}
+```
+
+The return is a hierarchical list of dataframes whose values contain lists of dataframes whose values contain lists of... the R version of JSON?  Fortunately, `pluck` is able to pick out, for each employment affiliation: the organization name; the department name and position title; and the affiliation end date.  We then filter for those records that mention some form of the UCSB name.  We also filter for those records that *don't* have an affiliation end date, the theory being that those represent current employment.  (Of course, it's entirely possible that people neglected to update their ORCID profiles when they left UCSB, just as they might never have added any dates at all.)
+
+```{r}
+df <- reduce(
+        map(employment_data, pluck, "affiliation-group", "summaries"),
+        bind_rows
+    ) %>%
+    as_tibble %>%
+    mutate(id = str_sub(`employment-summary.path`, 2, 20)) %>%
+    select(
+        id,
+        institution=`employment-summary.organization.name`,
+        department=`employment-summary.department-name`,
+        title=`employment-summary.role-title`,
+        end_date=`employment-summary.end-date.year.value`,
+    ) %>%
+    filter(institution %in% ucsb_names & is.na(end_date)) %>%
+    select(id, department, title) %>%
+    arrange(id)
+
+head(df)
+```
+
+How many records did we get?
+
+```{r}
+nrow(df)
+```
+
+I.e., of the `r attr(ucsb_ids, "found")` ORCID IDs found that have some kind of UCSB affiliation, `r nrow(df)` of those reflect current employment at UCSB.
+
+Well that's not exactly correct because `r nrow(df)` is the count of employment records returned, not a count of IDs.  If somebody has multiple concurrent positions at UCSB they might have multiple employment records.  Or, as noted previously, they might have had serial UCSB employments and neglected to add end dates or any dates at all.  The number of unique ORCID IDs among the employment records is:
+
+```{r}
+length(unique(df$id))
+```
+
+So, the vast majority of IDs have one current UCSB employment recorded.
+
+# Grouping by department
+
+Let's group employment records by department to get a sense of the distribution of ORCID IDs across campus.  (The table below is scrollable.)
+
+```{r eval=FALSE}
+df %>%
+    group_by(department) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count), department, .locale="en")
+```
+
+```{r echo=FALSE}
+#| class: long-output
+df %>%
+    group_by(department) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count), department, .locale="en")
+```
+
+\
+Well, that's the usual freetext mess.  If you look closely, multiple variants of the same department name occur, there are varying abbreviations and typos, multiple departments are listed in the same record, and so forth.
+
+# Cleaning up department names
+
+We can clean up the department names using classification against a list of known, good names (obtained mostly from [here](https://www.ucsb.edu/academics/academic-departments-and-programs)).  For a distance metric we use Levenshtein editing distance.
+
+```{r eval=FALSE}
+seen_names = df %>%
+    select(name=department) %>%
+    drop_na %>%
+    filter(str_detect(name, "[a-z]")) %>%  # remove pure acronyms
+    mutate(name_lc=str_to_lower(name)) %>%
+    mutate(name_lc=str_replace(name_lc, "department( of)?", ""))
+
+good_names <- read_csv("departments.csv") %>%
+    mutate(name_lc=str_to_lower(name))
+
+m <- stringdistmatrix(
+    seen_names$name_lc,
+    good_names$name_lc,
+    method="lv"
+)
+
+by_row <- 1
+seen_names$classified = good_names$name[apply(m, by_row, which.min)]
+
+seen_names %>%
+    select(department=classified) %>%
+    group_by(department) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count))
+```
+
+Here's the cleaned-up list.  (The table below is scrollable.)
+
+```{r echo=FALSE, message=FALSE}
+#| class: long-output
+seen_names = df %>%
+    select(name=department) %>%
+    drop_na %>%
+    filter(str_detect(name, "[a-z]")) %>%  # remove pure acronyms
+    mutate(name_lc=str_to_lower(name)) %>%
+    mutate(name_lc=str_replace(name_lc, "department( of)?", ""))
+
+good_names <- read_csv("departments.csv") %>%
+    mutate(name_lc=str_to_lower(name))
+
+m <- stringdistmatrix(
+    seen_names$name_lc,
+    good_names$name_lc,
+    method="lv"
+)
+
+by_row <- 1
+seen_names$classified = good_names$name[apply(m, by_row, which.min)]
+
+seen_names %>%
+    select(department=classified) %>%
+    group_by(department) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count))
+```
+
+# Grouping by title
+
+We can similarly group the employment records by position title, which might give us a sense of the extent to which different groups of people are using ORCID.  Note that role/title isn't populated as frequently as department in ORCID profiles.  (The table below is scrollable.)
+
+```{r eval=FALSE}
+df %>%
+    group_by(title) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count))
+```
+
+```{r echo=FALSE}
+#| class: long-output
+df %>%
+    group_by(title) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count))
+```
+
+\
+Let's consolidate these varying descriptions into a few broad categories as follows.
+
+```{r}
+match <- Vectorize(
+    function(title, patterns) {
+        # Return TRUE if `title` matches any of the given patterns
+        any(
+            map_lgl(
+                patterns,
+                \(p) str_like(title, paste("%", p, "%", sep=""))
+            )
+        )
+    },
+    "title"
+)
+
+df %>%
+    drop_na(title) %>%
+    mutate(
+        category=case_when(
+            match(
+                title,
+                c("professor", "lecturer", "instructor", "dean")
+            ) ~ "faculty",
+            match(
+                title,
+                c("student", "graduate", "teaching", "TA", "PhD",
+                  "candidate")
+            ) ~ "student",
+            match(
+                title,
+                c("post", "fellow")
+            ) ~ "postdoc",
+            match(
+                title,
+                c("research", "specialist", "scientist", "director",
+                  "coordinator", "librarian", "curator", "associate",
+                  "manager", "engineer", "developer")
+            ) ~ "staff",
+            .default="other"
+        )
+    ) %>%
+    group_by(category) %>%
+    summarize(count=n()) %>%
+    arrange(desc(count))
+```
